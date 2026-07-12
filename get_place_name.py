@@ -13,13 +13,20 @@ get_place_name.py —— 地名轮播 + 资料推送
   5. 通过 pushplus 接口推送（template=html, channel=wechat,extension）
   —— 本方案无状态：不读写序号文件、不回写仓库，天然幂等，可放心在云端定时任务反复运行
 
-依赖：仅标准库（csv / json / re / os / urllib / datetime / html）
+依赖：仅标准库（csv / json / re / os / urllib / datetime / html / argparse）
 
 环境变量：
-  LLM_API_KEY    大模型 API Key（必填才能自动查资料）
+  LLM_API_KEY    大模型 API Key（仅 --auto 自动查资料模式需要）
   LLM_BASE_URL   兼容接口地址，默认 https://api.openai.com/v1
   LLM_MODEL      模型名，默认 gpt-4o-mini
   PUSHPLUS_TOKEN pushplus 推送 token（脚本已内置默认值）
+
+运行模式（命令行）：
+  python get_place_name.py                 # --auto：调用 LLM 查资料 → 渲染 → 推送（自托管用）
+  python get_place_name.py --compute       # 仅按当前时刻算出本期地名，打印 JSON，不查资料、不推送
+  python get_place_name.py --report --md research.md
+                                          # 读取 research.md（模型已写好的资料）→ 渲染 HTML → 推送
+  —— 云端定时任务推荐用 --compute + --report 组合：由模型负责“查资料”，脚本只做取地名/渲染/推送
 """
 
 import csv
@@ -262,8 +269,43 @@ def push_plus(title, content_html):
         return json.loads(resp.read().decode("utf-8"))
 
 
-# ---------------------- 主流程 ----------------------
-def main():
+# ---------------------- 各模式入口 ----------------------
+def mode_compute():
+    """仅按当前时刻算出本期地名并打印 JSON（不查资料、不推送）。"""
+    place = get_period_place()
+    out = {
+        "index": place["index"],
+        "period_label": place["period_label"],
+        "city": place["city"]["name"],
+        "county": place["county"]["name"],
+        "city_from_parent": place["city_from_parent"],
+    }
+    print(json.dumps(out, ensure_ascii=False))
+    return place
+
+
+def mode_report(md_path):
+    """读取模型写好的资料(md)，渲染 HTML 并推送到 pushplus。"""
+    place = get_period_place()
+    _src = "所属地市" if place.get("city_from_parent") else "独立序号"
+    print(f"本期序号: {place['index']}（{place['period_label']}）| 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
+
+    with open(md_path, "r", encoding="utf-8") as f:
+        md = f.read()
+    html = render_html(place, md)
+    title = f"{place['city']['name']} · {place['county']['name']}（第{place['index']}期 · {place['period_label']}）"
+
+    result = push_plus(title, html)
+    print("推送结果:", result)
+    if result.get("code") == 200:
+        print("推送成功（本方案无状态，无需回写序号）。")
+    else:
+        print("推送未成功。")
+    return result
+
+
+def mode_auto():
+    """--auto：调用 LLM 查资料 → 渲染 → 推送（自托管 / 有 API key 时用）。"""
     place = get_period_place()
     _src = "所属地市" if place.get("city_from_parent") else "独立序号"
     print(f"本期序号: {place['index']}（{place['period_label']}）| 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
@@ -281,4 +323,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="地名轮播 + 资料推送")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--compute", action="store_true", help="仅计算本期地名并打印 JSON")
+    group.add_argument("--report", action="store_true", help="读取资料 md 并渲染推送")
+    group.add_argument("--auto", action="store_true", help="调用 LLM 查资料并推送（需 LLM_API_KEY）")
+    parser.add_argument("--md", default="research.md", help="--report 时使用的资料 md 文件路径")
+    args = parser.parse_args()
+
+    if args.compute:
+        mode_compute()
+    elif args.report:
+        mode_report(args.md)
+    else:
+        # 默认即 --auto
+        mode_auto()
