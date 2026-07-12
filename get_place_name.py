@@ -15,17 +15,20 @@ get_place_name.py —— 地名轮播 + 资料推送
 
 依赖：仅标准库（csv / json / math / os / urllib / datetime / html / re）
 
-环境变量（可选）：
+环境变量：
   LLM_API_KEY    大模型 API Key（必填才能自动查资料）
   LLM_BASE_URL   兼容接口地址，默认 https://api.openai.com/v1
   LLM_MODEL      模型名，默认 gpt-4o-mini
   PUSHPLUS_TOKEN pushplus 推送 token（脚本已内置默认值）
+  GITHUB_TOKEN   GitHub 细粒度 token（需 Contents 读写权限，范围限定本仓库）。
+                 用于把序号自动回写仓库；不设置则只更新本地 read_index.json。
 """
 
 import csv
 import json
 import os
 import re
+import base64
 import html as _html
 import urllib.request
 import urllib.error
@@ -43,6 +46,17 @@ PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "105d09684cdd41a888866c3b4ca81
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+
+# ---------------------- GitHub 回写配置 ----------------------
+# 用于把 read_index.json 同步回仓库（实现“自动更新”序号记录）。
+GITHUB_OWNER = "herainyoe"
+GITHUB_REPO = "Zane"
+GITHUB_BRANCH = "main"
+INDEX_NAME = "read_index.json"
+# token 从环境变量 GITHUB_TOKEN 读取（细粒度 token，需 Contents 读写权限，范围限定本仓库）。
+# ⚠️ 注意：本仓库为公开仓库，GitHub 的 secret scanning 会拦截任何写进代码的真实 token，
+#    因此 token 必须通过环境变量传入（运行前 export GITHUB_TOKEN=github_pat_xxx），切勿硬编码。
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 TZ = timezone(timedelta(hours=8))  # 北京时间
 
@@ -268,6 +282,57 @@ def push_plus(title, content_html):
         return json.loads(resp.read().decode("utf-8"))
 
 
+# ---------------------- GitHub 回写序号 ----------------------
+def sync_index_to_github(record):
+    """把更新后的 read_index.json 回写到 GitHub 仓库（fine-grained token 认证）。
+
+    返回 True/False，失败不影响主流程（本地文件已写好）。
+    """
+    if not GITHUB_TOKEN:
+        print("未配置 GITHUB_TOKEN，跳过 GitHub 回写。")
+        return False
+    api = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+           f"/contents/{INDEX_NAME}")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    # 1) 取当前文件 sha（更新必需）；404 表示文件不存在则新建
+    try:
+        req = urllib.request.Request(api, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=30) as r:
+            sha = json.loads(r.read())["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            sha = None
+        else:
+            print("GitHub 读取失败:", e.code, e.read().decode())
+            return False
+
+    content = json.dumps(record, ensure_ascii=False, indent=2)
+    payload = {
+        "message": f"auto: update {INDEX_NAME} (last_index={record.get('last_index')})",
+        "content": base64.b64encode(content.encode("utf-8")).decode(),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+    req = urllib.request.Request(
+        api,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={**headers, "Content-Type": "application/json"},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print("GitHub 回写成功 (HTTP %d)" % r.status)
+        return True
+    except urllib.error.HTTPError as e:
+        print("GitHub 回写失败:", e.code, e.read().decode())
+        return False
+
+
 # ---------------------- 主流程 ----------------------
 def main():
     place = get_next_place()
@@ -282,12 +347,14 @@ def main():
     print("推送结果:", result)
 
     if result.get("code") == 200:
-        save_index({
+        record = {
             "last_index": place["index"],
             "last_city": place["city"]["name"],
             "last_county": place["county"]["name"],
-        })
-        print("已写入 read_index.json（last_index = %d）" % place["index"])
+        }
+        save_index(record)  # 先写本地
+        print("已写入本地 read_index.json（last_index = %d）" % place["index"])
+        sync_index_to_github(record)  # 再同步回 GitHub
     else:
         print("推送未成功，未更新序号。")
 
