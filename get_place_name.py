@@ -68,7 +68,14 @@ def read_csv_rows(path):
 
 
 def get_next_place():
-    """读取上一次序号 +1，并从两个 CSV 中取出对应的市、县地名。"""
+    """读取上一次序号 +1，并从两个 CSV 中取出对应的市、县地名。
+
+    市、县数量不对等（市 393，区县 3210）。取市的规则：
+      - 当本次序号 new_index <= 市的最大数目时：市、县各自按序号独立取值；
+      - 当 new_index > 市的最大数目时：市名不再对市表取模轮播，而是改用
+        “本次县区所属的地市”（通过 county["pid"] 反查 city["id"] 得到），
+        这样超出市表范围后，展示的市与当次县区在行政区划上真正对应。
+    """
     index_record = load_index()
     last_index = index_record.get("last_index", 0)
     new_index = last_index + 1
@@ -76,8 +83,25 @@ def get_next_place():
     cities = read_csv_rows(CITY_FILE)
     counties = read_csv_rows(COUNTY_FILE)
 
-    city = cities[(new_index - 1) % len(cities)]
+    # 县区始终按序号取模轮播
     county = counties[(new_index - 1) % len(counties)]
+
+    # 构建 city_id -> city 行 的索引，用于按 pid 反查县区所属地市
+    city_by_id = {c["id"]: c for c in cities}
+
+    used_parent = False  # 标记本次市名是否来自“县区所属地市”
+    if new_index <= len(cities):
+        # 未超过市的最大数目：市、县各自独立取序号
+        city = cities[(new_index - 1) % len(cities)]
+    else:
+        # 超过市的最大数目：以当次县区所属的地市替代市名
+        parent = city_by_id.get(county.get("pid"))
+        if parent is not None:
+            city = parent
+            used_parent = True
+        else:
+            # 兜底：pid 查不到所属地市时，回退到取模轮播
+            city = cities[(new_index - 1) % len(cities)]
 
     return {
         "index": new_index,
@@ -91,6 +115,7 @@ def get_next_place():
             "id": county["id"],
             "pinyin": county["pinyin"],
         },
+        "city_from_parent": used_parent,
         "total_cities": len(cities),
         "total_counties": len(counties),
     }
@@ -207,6 +232,7 @@ def render_html(place, md_text):
     city = place["city"]["name"]
     county = place["county"]["name"]
     title = f"{city} · {county} —— 地名轮播 No.{place['index']}"
+    parent_tag = "（所属地市）" if place.get("city_from_parent") else ""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -214,7 +240,7 @@ def render_html(place, md_text):
 <body>
 <div class="card">
   <div class="head">
-    <h1>{city} <span class="sub">· {county}</span></h1>
+    <h1>{city}{parent_tag} <span class="sub">· {county}</span></h1>
     <div class="meta">第 {place['index']} 期 · 拼音 {place['city']['pinyin']} / {place['county']['pinyin']} · 共 {place['total_cities']} 市 / {place['total_counties']} 区县</div>
   </div>
   <div class="content">{body}</div>
@@ -245,7 +271,8 @@ def push_plus(title, content_html):
 # ---------------------- 主流程 ----------------------
 def main():
     place = get_next_place()
-    print(f"本次序号: {place['index']} | 市级: {place['city']['name']} | 县级: {place['county']['name']}")
+    _src = "所属地市" if place.get("city_from_parent") else "独立序号"
+    print(f"本次序号: {place['index']} | 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
 
     md = query_place_info(place["city"]["name"], place["county"]["name"])
     html = render_html(place, md)
