@@ -3,8 +3,9 @@
 """
 get_place_name.py —— 地名轮播 + 资料推送
 
-运行逻辑（日期驱动 · 无状态）：
-  1. 序号 = (今天日期 − 基准日期 BASE_DATE).days + 1（完全由时间决定，无需任何状态文件）
+运行逻辑（日期驱动 · 无状态 · 半天为周期）：
+  1. 基准时间 BASE_DATE = 2026-07-12 00:00（北京时间）。序号 = 距基准时间经过的“上午/下午”个数 + 1
+     （每 12 小时为一个周期：00:00–11:59 为上午、12:00–23:59 为下午，完全由运行时刻决定，无需任何状态文件）
   2. 按本期序号，分别从 city_level1.csv / county_level2.csv 取对应的市级、县级地名
   3. 调用大模型（OpenAI 兼容接口）查询这两个地名的资料
      （历史背景、风土人情、地理知识、特色产物、文化特色、社会民生等，有则列、无则省）
@@ -35,8 +36,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CITY_FILE = os.path.join(BASE_DIR, "city_level1.csv")
 COUNTY_FILE = os.path.join(BASE_DIR, "county_level2.csv")
 
-# 序号基准日：当天记为第 1 期，之后每天 +1（由日期确定性推导，无状态）
-BASE_DATE = datetime(2026, 7, 12, tzinfo=timezone(timedelta(hours=8)))
+# 序号基准时间：2026-07-12 00:00（北京时间）。每经过一个“上午/下午”（12 小时）序号 +1
+BASE_DATE = datetime(2026, 7, 12, 0, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+HALF_DAY = timedelta(hours=12)
 
 PUSHPLUS_URL = "http://www.pushplus.plus/batchSend"
 # 优先读环境变量；为空时回退到下方默认值（避免 CI 中传了空 secret 反而把默认值覆盖掉）
@@ -55,21 +57,24 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
-def get_today_place():
-    """按当前日期确定性地推导本期序号，并从两个 CSV 取对应的市、县地名。
+def get_period_place():
+    """按当前时刻确定性地推导本期序号，并从两个 CSV 取对应的市、县地名。
 
-    序号 = (今天 − BASE_DATE).days + 1，完全由时间决定，无需读取/写入任何状态文件，
-    因此在云端定时任务等无状态环境中可安全反复运行（同一天多次运行得到同一结果）。
+    序号 = 距 BASE_DATE 经过的“上午/下午”个数 + 1（每 12 小时为一个周期），
+    完全由运行时刻决定，无需读取/写入任何状态文件，
+    因此在云端定时任务等无状态环境中可安全反复运行（同一时刻多次运行得到同一结果）。
 
     市、县数量不对等（市 393，区县 3210）。取市的规则：
       - 当本期序号 <= 市的最大数目时：市、县各自按序号独立取值；
       - 当本期序号 > 市的最大数目时：市名改用“当次县区所属的地市”
         （通过 county["pid"] 反查 city["id"] 得到），使市县在行政区划上真正对应。
     """
-    today = datetime.now(TZ).date()
-    index = (today - BASE_DATE.date()).days + 1
+    now = datetime.now(TZ)
+    index = int((now - BASE_DATE).total_seconds() // HALF_DAY.total_seconds()) + 1
     if index < 1:
-        index = 1  # 基准日之前兜底为第 1 期
+        index = 1  # 基准时间之前兜底为第 1 期
+    # 第奇数个周期为上午、偶数为下午（period1=上午第1天, period2=下午第1天, ...）
+    period_label = "上午" if index % 2 == 1 else "下午"
 
     cities = read_csv_rows(CITY_FILE)
     counties = read_csv_rows(COUNTY_FILE)
@@ -104,6 +109,7 @@ def get_today_place():
             "pinyin": county["pinyin"],
         },
         "city_from_parent": used_parent,
+        "period_label": period_label,
         "total_cities": len(cities),
         "total_counties": len(counties),
     }
@@ -219,7 +225,7 @@ def render_html(place, md_text):
     body = md_to_html(md_text)
     city = place["city"]["name"]
     county = place["county"]["name"]
-    title = f"{city} · {county} —— 地名轮播 No.{place['index']}"
+    title = f"{city} · {county} —— 地名轮播 No.{place['index']}（{place['period_label']}）"
     parent_tag = "（所属地市）" if place.get("city_from_parent") else ""
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -229,7 +235,7 @@ def render_html(place, md_text):
 <div class="card">
   <div class="head">
     <h1>{city}{parent_tag} <span class="sub">· {county}</span></h1>
-    <div class="meta">第 {place['index']} 期 · 拼音 {place['city']['pinyin']} / {place['county']['pinyin']} · 共 {place['total_cities']} 市 / {place['total_counties']} 区县</div>
+    <div class="meta">第 {place['index']} 期（{place['period_label']}） · 拼音 {place['city']['pinyin']} / {place['county']['pinyin']} · 共 {place['total_cities']} 市 / {place['total_counties']} 区县</div>
   </div>
   <div class="content">{body}</div>
   <div class="footer">由 get_place_name.py 自动生成 · pushplus 推送</div>
@@ -258,9 +264,9 @@ def push_plus(title, content_html):
 
 # ---------------------- 主流程 ----------------------
 def main():
-    place = get_today_place()
+    place = get_period_place()
     _src = "所属地市" if place.get("city_from_parent") else "独立序号"
-    print(f"本期序号: {place['index']} | 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
+    print(f"本期序号: {place['index']}（{place['period_label']}）| 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
 
     md = query_place_info(place["city"]["name"], place["county"]["name"])
     html = render_html(place, md)
