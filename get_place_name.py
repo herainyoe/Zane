@@ -3,32 +3,28 @@
 """
 get_place_name.py —— 地名轮播 + 资料推送
 
-运行逻辑（对应需求）：
-  1. 从 read_index.json 读取上一次的读取序号 last_index
-  2. 本次序号 = last_index + 1
-  3. 按本次序号，分别从 city_level1.csv / county_level2.csv 取对应的市级、县级地名
-  4. 调用大模型（OpenAI 兼容接口）查询这两个地名的资料
+运行逻辑（日期驱动 · 无状态）：
+  1. 序号 = (今天日期 − 基准日期 BASE_DATE).days + 1（完全由时间决定，无需任何状态文件）
+  2. 按本期序号，分别从 city_level1.csv / county_level2.csv 取对应的市级、县级地名
+  3. 调用大模型（OpenAI 兼容接口）查询这两个地名的资料
      （历史背景、风土人情、地理知识、特色产物、文化特色、社会民生等，有则列、无则省）
-  5. 将资料整合为 HTML
-  6. 通过 pushplus 接口推送（template=html, channel=wechat,extension）
-  7. 推送成功后，将本次序号写回 read_index.json
+  4. 将资料整合为 HTML
+  5. 通过 pushplus 接口推送（template=html, channel=wechat,extension）
+  —— 本方案无状态：不读写序号文件、不回写仓库，天然幂等，可放心在云端定时任务反复运行
 
-依赖：仅标准库（csv / json / math / os / urllib / datetime / html / re）
+依赖：仅标准库（csv / json / re / os / urllib / datetime / html）
 
 环境变量：
   LLM_API_KEY    大模型 API Key（必填才能自动查资料）
   LLM_BASE_URL   兼容接口地址，默认 https://api.openai.com/v1
   LLM_MODEL      模型名，默认 gpt-4o-mini
   PUSHPLUS_TOKEN pushplus 推送 token（脚本已内置默认值）
-  GITHUB_TOKEN   GitHub 细粒度 token（需 Contents 读写权限，范围限定本仓库）。
-                 用于把序号自动回写仓库；不设置则只更新本地 read_index.json。
 """
 
 import csv
 import json
 import os
 import re
-import base64
 import html as _html
 import urllib.request
 import urllib.error
@@ -38,41 +34,19 @@ from datetime import datetime, timezone, timedelta
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CITY_FILE = os.path.join(BASE_DIR, "city_level1.csv")
 COUNTY_FILE = os.path.join(BASE_DIR, "county_level2.csv")
-INDEX_FILE = os.path.join(BASE_DIR, "read_index.json")
+
+# 序号基准日：当天记为第 1 期，之后每天 +1（由日期确定性推导，无状态）
+BASE_DATE = datetime(2026, 7, 12, tzinfo=timezone(timedelta(hours=8)))
 
 PUSHPLUS_URL = "http://www.pushplus.plus/batchSend"
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "105d09684cdd41a888866c3b4ca81844")
+# 优先读环境变量；为空时回退到下方默认值（避免 CI 中传了空 secret 反而把默认值覆盖掉）
+PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN") or "105d09684cdd41a888866c3b4ca81844"
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-
-# ---------------------- GitHub 回写配置 ----------------------
-# 用于把 read_index.json 同步回仓库（实现“自动更新”序号记录）。
-GITHUB_OWNER = "herainyoe"
-GITHUB_REPO = "Zane"
-GITHUB_BRANCH = "main"
-INDEX_NAME = "read_index.json"
-# token 从环境变量 GITHUB_TOKEN 读取（细粒度 token，需 Contents 读写权限，范围限定本仓库）。
-# ⚠️ 注意：本仓库为公开仓库，GitHub 的 secret scanning 会拦截任何写进代码的真实 token，
-#    因此 token 必须通过环境变量传入（运行前 export GITHUB_TOKEN=github_pat_xxx），切勿硬编码。
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or "https://api.openai.com/v1"
+LLM_MODEL = os.environ.get("LLM_MODEL") or "gpt-4o-mini"
 
 TZ = timezone(timedelta(hours=8))  # 北京时间
-
-
-# ---------------------- 序号管理 ----------------------
-def load_index():
-    if not os.path.exists(INDEX_FILE):
-        return {"last_index": 0, "last_city": None, "last_county": None, "updated_at": None}
-    with open(INDEX_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_index(record):
-    record["updated_at"] = datetime.now(TZ).isoformat()
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
 
 
 # ---------------------- 读取地名 ----------------------
@@ -81,44 +55,44 @@ def read_csv_rows(path):
         return list(csv.DictReader(f))
 
 
-def get_next_place():
-    """读取上一次序号 +1，并从两个 CSV 中取出对应的市、县地名。
+def get_today_place():
+    """按当前日期确定性地推导本期序号，并从两个 CSV 取对应的市、县地名。
+
+    序号 = (今天 − BASE_DATE).days + 1，完全由时间决定，无需读取/写入任何状态文件，
+    因此在云端定时任务等无状态环境中可安全反复运行（同一天多次运行得到同一结果）。
 
     市、县数量不对等（市 393，区县 3210）。取市的规则：
-      - 当本次序号 new_index <= 市的最大数目时：市、县各自按序号独立取值；
-      - 当 new_index > 市的最大数目时：市名不再对市表取模轮播，而是改用
-        “本次县区所属的地市”（通过 county["pid"] 反查 city["id"] 得到），
-        这样超出市表范围后，展示的市与当次县区在行政区划上真正对应。
+      - 当本期序号 <= 市的最大数目时：市、县各自按序号独立取值；
+      - 当本期序号 > 市的最大数目时：市名改用“当次县区所属的地市”
+        （通过 county["pid"] 反查 city["id"] 得到），使市县在行政区划上真正对应。
     """
-    index_record = load_index()
-    last_index = index_record.get("last_index", 0)
-    new_index = last_index + 1
+    today = datetime.now(TZ).date()
+    index = (today - BASE_DATE.date()).days + 1
+    if index < 1:
+        index = 1  # 基准日之前兜底为第 1 期
 
     cities = read_csv_rows(CITY_FILE)
     counties = read_csv_rows(COUNTY_FILE)
 
     # 县区始终按序号取模轮播
-    county = counties[(new_index - 1) % len(counties)]
+    county = counties[(index - 1) % len(counties)]
 
     # 构建 city_id -> city 行 的索引，用于按 pid 反查县区所属地市
     city_by_id = {c["id"]: c for c in cities}
 
     used_parent = False  # 标记本次市名是否来自“县区所属地市”
-    if new_index <= len(cities):
-        # 未超过市的最大数目：市、县各自独立取序号
-        city = cities[(new_index - 1) % len(cities)]
+    if index <= len(cities):
+        city = cities[(index - 1) % len(cities)]
     else:
-        # 超过市的最大数目：以当次县区所属的地市替代市名
         parent = city_by_id.get(county.get("pid"))
         if parent is not None:
             city = parent
             used_parent = True
         else:
-            # 兜底：pid 查不到所属地市时，回退到取模轮播
-            city = cities[(new_index - 1) % len(cities)]
+            city = cities[(index - 1) % len(cities)]
 
     return {
-        "index": new_index,
+        "index": index,
         "city": {
             "name": city["ext_name"],
             "id": city["id"],
@@ -282,62 +256,11 @@ def push_plus(title, content_html):
         return json.loads(resp.read().decode("utf-8"))
 
 
-# ---------------------- GitHub 回写序号 ----------------------
-def sync_index_to_github(record):
-    """把更新后的 read_index.json 回写到 GitHub 仓库（fine-grained token 认证）。
-
-    返回 True/False，失败不影响主流程（本地文件已写好）。
-    """
-    if not GITHUB_TOKEN:
-        print("未配置 GITHUB_TOKEN，跳过 GitHub 回写。")
-        return False
-    api = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-           f"/contents/{INDEX_NAME}")
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    # 1) 取当前文件 sha（更新必需）；404 表示文件不存在则新建
-    try:
-        req = urllib.request.Request(api, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            sha = json.loads(r.read())["sha"]
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            sha = None
-        else:
-            print("GitHub 读取失败:", e.code, e.read().decode())
-            return False
-
-    content = json.dumps(record, ensure_ascii=False, indent=2)
-    payload = {
-        "message": f"auto: update {INDEX_NAME} (last_index={record.get('last_index')})",
-        "content": base64.b64encode(content.encode("utf-8")).decode(),
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        payload["sha"] = sha
-    req = urllib.request.Request(
-        api,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={**headers, "Content-Type": "application/json"},
-        method="PUT",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            print("GitHub 回写成功 (HTTP %d)" % r.status)
-        return True
-    except urllib.error.HTTPError as e:
-        print("GitHub 回写失败:", e.code, e.read().decode())
-        return False
-
-
 # ---------------------- 主流程 ----------------------
 def main():
-    place = get_next_place()
+    place = get_today_place()
     _src = "所属地市" if place.get("city_from_parent") else "独立序号"
-    print(f"本次序号: {place['index']} | 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
+    print(f"本期序号: {place['index']} | 市级: {place['city']['name']}（{_src}） | 县级: {place['county']['name']}")
 
     md = query_place_info(place["city"]["name"], place["county"]["name"])
     html = render_html(place, md)
@@ -345,18 +268,10 @@ def main():
 
     result = push_plus(title, html)
     print("推送结果:", result)
-
     if result.get("code") == 200:
-        record = {
-            "last_index": place["index"],
-            "last_city": place["city"]["name"],
-            "last_county": place["county"]["name"],
-        }
-        save_index(record)  # 先写本地
-        print("已写入本地 read_index.json（last_index = %d）" % place["index"])
-        sync_index_to_github(record)  # 再同步回 GitHub
+        print("推送成功（本方案无状态，无需回写序号）。")
     else:
-        print("推送未成功，未更新序号。")
+        print("推送未成功。")
 
 
 if __name__ == "__main__":
