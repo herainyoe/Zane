@@ -1,6 +1,0 @@
-# 本地凭据，切勿提交
-.env
-
-# Python 缓存
-__pycache__/
-*.pyc
